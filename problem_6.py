@@ -35,8 +35,8 @@ def _flash_attention_forward_swa_kernel(
     # This problem combines GQA and SWA. First, implement the GQA logic.
     # 1. Calculate the number of query heads per group.
     # 2. Determine the correct kv_head_idx for the current q_head_idx.
-    
-    kv_head_idx = 0    # Placeholder: Replace with your GQA calculation
+    group_size = N_Q_HEADS // N_KV_HEADS
+    kv_head_idx = q_head_idx // group_size
     # --- END OF GQA IMPLEMENTATION ---
 
 
@@ -49,7 +49,7 @@ def _flash_attention_forward_swa_kernel(
     q_offsets = (q_block_idx * BLOCK_M + tl.arange(0, BLOCK_M))
     q_ptrs = Q_ptr + batch_idx * q_stride_b + q_head_idx * q_stride_h + \
              (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
-    q_block = tl.load(q_ptrs, mask=q_offsets[:, None] < SEQ_LEN, other=0.0)
+    q_block = tl.load(q_ptrs, mask=q_offsets[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
     
     qk_scale = softmax_scale * 1.44269504
 
@@ -59,20 +59,118 @@ def _flash_attention_forward_swa_kernel(
     # 1. Calculate the starting position of the attention window (window_start).
     # 2. Modify the range of the Phase 1 loop to start from your window_start.
 
-    window_start = 0 # Placeholder: Replace with your SWA calculation
+    q_start = q_block_idx * BLOCK_M
+    win_left = q_start - (WINDOW_SIZE - 1)
+    window_start = tl.maximum(0, win_left)
+    # Previously, I did
+    # window_start = tl.maximum(0, q_block_idx * BLOCK_M - WINDOW_SIZE)
+    # which is wrong
+
+    diag_start = q_block_idx * BLOCK_M
 
     # --- Phase 1: Off-Diagonal Blocks (within the window) ---
     for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
         # STUDENT IMPLEMENTATION REQUIRED (Part 3: SWA Logic)
         # Hint: You might need to apply the per-element sliding window mask to s_ij.
         #    - A score is invalid if `(query_offset - key_offset) >= WINDOW_SIZE`.
-        pass
+        # CAUSAL! So only past keys. Therefore, no need to check for negative indices.
+        # Load K
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        # Load V
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        # 2. Compute the attention scores (S_ij).
+        k_block = k_block.to(tl.float32)
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        v_block = v_block.to(tl.float32)
+        
+        # Sliding window mask
+        dist = q_offsets[:, None] - k_offsets[None, :] #(BLOCK_M, BLOCK_N)
+        window_mask = (dist >= 0) & (dist < WINDOW_SIZE)
+
+        # Validity mask
+        valid_mask = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
+
+        # Prevent overlap with diagonal tile:
+        pre_diag_mask = k_offsets[None, :] < diag_start
+
+        # Combine masks
+        mask = window_mask & valid_mask & pre_diag_mask
+        s_ij = tl.where(mask, s_ij, -float('inf'))
+
+        # Row has anything valid in this tile?
+        row_has = tl.max(mask, axis=1) > 0
+
+        # online softmax update
+        m_ij  = tl.max(s_ij, axis=1)
+        # Only update rows that have something valid
+        m_new = tl.where(row_has, tl.maximum(m_i, m_ij), m_i)
+        # Calculate scale factor only for rows that have something valid
+        scale_factor = tl.where(row_has, tl.exp2(m_i - m_new), 1.0)
+
+        # Probabilities only for rows that have something valid
+        p_ij = tl.where(row_has[:, None], tl.exp2(s_ij - m_new[:, None]), 0.0)
+
+        acc = acc * scale_factor[:, None] + tl.dot(p_ij, v_block)
+        l_i = l_i * scale_factor + tl.sum(p_ij, axis=1)
+        m_i = m_new
 
     # --- Phase 2: Diagonal Blocks ---
     diag_start = q_block_idx * BLOCK_M
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
         # STUDENT IMPLEMENTATION REQUIRED
-        pass
+        # Load K
+        k_offsets = start_n + tl.arange(0, BLOCK_N)  # (BLOCK_N,)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        # Load V
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        # 2. Compute the attention scores (S_ij).
+        k_block = k_block.to(tl.float32)
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        v_block = v_block.to(tl.float32)
+
+        # Sliding window mask
+        dist = q_offsets[:, None] - k_offsets[None, :] #(BLOCK_M, BLOCK_N)
+        window_mask = (dist >= 0) & (dist < WINDOW_SIZE)
+
+        # Combine masks
+        causal = q_offsets[:, None] >= k_offsets[None, :] #Lower triangle true
+        valid = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
+        mask = causal & valid & window_mask
+
+        # Apply mask BEFORE tile max so future tokens don't affect m_i
+        s_ij = tl.where(mask, s_ij, -float("inf"))
+
+        # Row has anything valid in this tile?
+        row_has = tl.max(mask, axis=1) > 0
+
+        # online softmax update
+        m_ij  = tl.max(s_ij, axis=1)
+        # Only update rows that have something valid
+        m_new = tl.where(row_has, tl.maximum(m_i, m_ij), m_i)
+        # Calculate scale factor only for rows that have something valid
+        scale_factor = tl.where(row_has, tl.exp2(m_i - m_new), 1.0)
+
+        # Probabilities only for rows that have something valid
+        p_ij = tl.where(row_has[:, None], tl.exp2(s_ij - m_new[:, None]), 0.0)
+
+        acc = acc * scale_factor[:, None] + tl.dot(p_ij, v_block)
+        l_i = l_i * scale_factor + tl.sum(p_ij, axis=1)
+        m_i = m_new
     # --- END OF SWA IMPLEMENTATION ---
 
 

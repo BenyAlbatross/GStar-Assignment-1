@@ -56,18 +56,28 @@ class FlashAttention2Function(torch.autograd.Function):
                         S_ij = (Q_tile @ K_tile.transpose(-1, -2)) * scale
                         
                         # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
+                        S_ij = S_ij.to(torch.float32)
+                        V_tile = V_tile.to(torch.float32)
                         # 1. Apply causal masking if is_causal is True.
-                        #
+                        if is_causal:
+                            q_idx = torch.arange(q_start, q_end, device=Q.device)[:, None]
+                            k_idx = torch.arange(k_start, k_end, device=Q.device)[None, :]
+                            mask = k_idx > q_idx  # (q_len, k_len)
+                            S_ij = S_ij.masked_fill(mask, torch.finfo(torch.float32).min)
                         # 2. Compute the new running maximum
-                        #
+                        m_ij = torch.max(S_ij, dim=-1).values #(128,)
+                        m_new = torch.maximum(m_i, m_ij) #m_i is (128,) -> m_new is (128,)
                         # 3. Rescale the previous accumulators (o_i, l_i)
-                        #
+                        scale_factor = torch.exp(m_i - m_new) #(128,)
+                        o_i = o_i * scale_factor.unsqueeze(-1) # o_i is (128,16) -> (128,16)
+                        l_i = l_i * scale_factor # l_i is (128,) -> (128,)
                         # 4. Compute the probabilities for the current tile, P_tilde_ij = exp(S_ij - m_new).
-                        #
+                        P_tilde_ij = torch.exp(S_ij - m_new.unsqueeze(-1)) #(128,128)
                         # 5. Accumulate the current tile's contribution to the accumulators to update l_i and o_i
-                        #
+                        o_i = o_i + (P_tilde_ij @ V_tile) #V_tile is (128,16)
+                        l_i = l_i + P_tilde_ij.sum(dim=-1) #P_tilde_ij.sum(dim=-1) -> (128,) sum over cols (row-wise)
                         # 6. Update the running max for the next iteration
-                        
+                        m_i = m_new
                         # --- END OF STUDENT IMPLEMENTATION ---
 
                     # After iterating through all key tiles, normalize the output
