@@ -67,7 +67,7 @@ def _flash_attention_forward_swa_kernel(
     diag_start = q_block_idx * BLOCK_M
 
     # Phase 0: Attetion sink only
-    for start_n in range(0, SINK_SIZE, BLOCK_N): # We use the whole matrix, but only the first SINK_SIZE columns which can be > 1. So not necessarily lower traingular!!
+    for start_n in range(0, SINK_SIZE, BLOCK_N): # We use the whole matrix, but only the first SINK_SIZE columns which can be > 1. So not necessarily lower triangular!!
         #Load K
         k_offsets = start_n + tl.arange(0, BLOCK_N)
         k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
