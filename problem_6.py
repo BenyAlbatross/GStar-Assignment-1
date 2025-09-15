@@ -95,14 +95,15 @@ def _flash_attention_forward_swa_kernel(
         dist = q_offsets[:, None] - k_offsets[None, :] #(BLOCK_M, BLOCK_N)
         window_mask = (dist >= 0) & (dist < WINDOW_SIZE)
 
-        # Validity mask
-        valid_mask = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
+        # Validity mask - not required
+        # valid_mask = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
 
         # Prevent overlap with diagonal tile:
         pre_diag_mask = k_offsets[None, :] < diag_start
 
         # Combine masks
-        mask = window_mask & valid_mask & pre_diag_mask
+        mask = window_mask & pre_diag_mask
+    
         s_ij = tl.where(mask, s_ij, -float('inf'))
 
         # Row has anything valid in this tile?
@@ -145,12 +146,12 @@ def _flash_attention_forward_swa_kernel(
 
         # Sliding window mask
         dist = q_offsets[:, None] - k_offsets[None, :] #(BLOCK_M, BLOCK_N)
-        window_mask = (dist >= 0) & (dist < WINDOW_SIZE)
+        # window_mask = (dist >= 0) & (dist < WINDOW_SIZE)
 
         # Combine masks
         causal = q_offsets[:, None] >= k_offsets[None, :] #Lower triangle true
-        valid = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
-        mask = causal & valid & window_mask
+        # valid = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
+        mask = causal
 
         # Apply mask BEFORE tile max so future tokens don't affect m_i
         s_ij = tl.where(mask, s_ij, -float("inf"))

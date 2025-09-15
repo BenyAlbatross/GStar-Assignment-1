@@ -67,7 +67,7 @@ def _flash_attention_forward_swa_kernel(
     diag_start = q_block_idx * BLOCK_M
 
     # Phase 0: Attetion sink only
-    for start_n in range(0, SINK_SIZE, BLOCK_N):
+    for start_n in range(0, SINK_SIZE, BLOCK_N): # We use the whole matrix, but only the first SINK_SIZE columns which can be > 1. So not necessarily lower traingular!!
         #Load K
         k_offsets = start_n + tl.arange(0, BLOCK_N)
         k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
@@ -88,8 +88,8 @@ def _flash_attention_forward_swa_kernel(
         # Masks
         sink_cols = (k_offsets[None, :] < SINK_SIZE)
         causal    = (q_offsets[:, None] >= k_offsets[None, :])
-        valid     = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
-        mask      = sink_cols & causal & valid
+        #valid     = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
+        mask      = sink_cols & causal #Causal is needed, unlike Phase 1, because we use the whole matrix
 
         s_ij = tl.where(mask, s_ij, -float('inf'))
 
@@ -137,13 +137,13 @@ def _flash_attention_forward_swa_kernel(
         window_mask = (dist >= 0) & (dist < WINDOW_SIZE)
 
         # Validity mask
-        valid_mask = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
+        # valid_mask = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
 
         # Prevent overlap with diagonal tile:
         pre_diag_mask = k_offsets[None, :] < diag_start
 
         # Combine masks
-        mask = window_mask & valid_mask & pre_diag_mask & non_sink
+        mask = window_mask & pre_diag_mask & non_sink #valid not needed
         s_ij = tl.where(mask, s_ij, -float('inf'))
 
         # Row has anything valid in this tile?
@@ -187,13 +187,13 @@ def _flash_attention_forward_swa_kernel(
         non_sink = k_offsets[None, :] >= SINK_SIZE
 
         # Sliding window mask
-        dist = q_offsets[:, None] - k_offsets[None, :] #(BLOCK_M, BLOCK_N)
-        window_mask = (dist >= 0) & (dist < WINDOW_SIZE)
+        # dist = q_offsets[:, None] - k_offsets[None, :] #(BLOCK_M, BLOCK_N)
+        # window_mask = (dist >= 0) & (dist < WINDOW_SIZE)
 
         # Combine masks
         causal = q_offsets[:, None] >= k_offsets[None, :] #Lower triangle true
-        valid = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
-        mask = causal & valid & window_mask & non_sink
+        # valid = (q_offsets[:, None] < SEQ_LEN) & (k_offsets[None, :] < SEQ_LEN)
+        mask = causal & non_sink #window and valid not needed for diag
 
         # Apply mask BEFORE tile max so future tokens don't affect m_i
         s_ij = tl.where(mask, s_ij, -float("inf"))
