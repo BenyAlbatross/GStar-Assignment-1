@@ -48,7 +48,7 @@ def weighted_row_sum_kernel(
         w_chunk = tl.load(W_ptr + col_offsets, mask=mask, other=0.0)
 
         # - Compute the element-wise product and add it to the accumulator.
-        accumulator += (x_chunk.to(tl.float32) * w_chunk.to(tl.float32))
+        accumulator += x_chunk * w_chunk
 
     # 6. Reduce the block-sized accumulator to a single scalar value after the loop.
     #    Hint: Use tl.sum().
@@ -94,7 +94,5 @@ def torch_weighted_row_sum(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """
     Reference implementation using pure PyTorch.
     """
-    x32 = x.to(torch.float32)
-    w32 = w.to(torch.float32)
-    y = (x32 * w32).sum(dim=1)
+    y = (x * w).sum(dim=1)
     return y.to(x.dtype)
